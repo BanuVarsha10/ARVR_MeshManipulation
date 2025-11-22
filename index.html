@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Spring-Tear Cloth — Realistic Spring Behavior (fixed)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body { margin:0; overflow:hidden; background:#0f0f13; color:#eee; font-family:system-ui,Segoe UI,Roboto,Arial; }
+  #ui { position: absolute; left: 12px; top: 12px; z-index: 50; background: rgba(255,255,255,0.06); padding:12px; border-radius:10px; width:320px; backdrop-filter: blur(6px); }
+  #ui h4 { margin:0 0 8px 0; font-size:14px; }
+  #ui label{ display:block; font-size:12px; margin-top:8px; }
+  #ui input[type=range]{ width:100%; }
+  #btnRow{ display:flex; gap:8px; margin-top:10px; }
+  #reset{ flex:1; padding:8px; border-radius:6px; border:none; background:#2b6cff; color:white; cursor:pointer; }
+  #status{ margin-top:8px; font-size:12px; color:#ddd; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="ui">
+    <h4>Spring-Tear Cloth — Springy behavior</h4>
+    <label>Structural stiffness: <span id="sK">1.0</span></label>
+    <input id="struct" type="range" min="0.2" max="3.0" step="0.05" value="1.0"/>
+    <label>Thickness stiffness: <span id="tK">1.5</span></label>
+    <input id="thick" type="range" min="0.1" max="5.0" step="0.1" value="1.5"/>
+    <label>Tension/stiffness:<span id="iters">4</span></label>
+    <input id="itersRange" type="range" min="1" max="12" step="1" value="4"/>
+    <label>Cut pressure multiplier: <span id="pM">0.5</span></label>
+    <input id="press" type="range" min="0" max="1" step="0.01" value="0.5"/>
+    <div id="btnRow">
+      <button id="reset">Reset Cloth</button>
+    </div>
+    <div id="status">Particles: — | Springs: — | Detached groups: —</div>
+  </div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ========== CONFIG ========== */
+const CONF = {
+  size: 12,
+  res: 28,
+  layers: 2,
+  layerGap: 0.6,
+  gravity: -9.8,
+  dt: 1/60,
+  structK: 1.0,
+  shearK: 0.9,
+  bendK: 0.6,
+  thicknessK: 1.5,
+  solverIters: 4,
+  baseCutR: 0.35,
+  pressureMultiplier: 0.5,
+  cutCooldown: 30, // ms
+  widenFactor: 0.28,
+  detachMinCount: 6,
+};
+
+/* ========== Globals ========== */
+let renderer, scene, camera, controls;
+let clothSim, cutter;
+let lastCut = 0;
+const statusEl = document.getElementById('status');
+const UPLOADED = '/mnt/data/dab8051c-60fd-4c60-a3c1-b3327c250b71.png';
+
+function checkerTexture(c1='#ffe0b5', c2='#d49352') {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 512;
+  const ctx = canvas.getContext('2d');
+  const N = 12, s = 512/N;
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
+    ctx.fillStyle = ((x+y)&1)?c1:c2;
+    ctx.fillRect(x*s,y*s,s,s);
+  }
+  const t = new THREE.CanvasTexture(canvas);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+
+/* ========== Node + Link ========== */
+class Node {
+  constructor(x,y,z,pinned=false){
+    this.pos = new THREE.Vector3(x,y,z);
+    this.prev = new THREE.Vector3(x,y,z);
+    this.acc = new THREE.Vector3(0,0,0);
+    this.pinned = pinned;
+    this.detached = false;
+  }
+}
+class Link {
+  constructor(a,b,rest,k,type){
+    this.a=a; this.b=b; this.rest=rest; this.k=k; this.active=true; this.type=type;
+  }
+}
+
+/* ========== ClothSim ========== */
+class ClothSim {
+  constructor(size,res,layers,gap){
+    this.size = size; this.res = res; this.layers = layers; this.gap = gap;
+    this.nodes = []; this.links = []; this.meshes = []; this.geos = [];
+    this.init();
+  }
+
+  idx(L,x,y){ return L*(this.res+1)*(this.res+1) + y*(this.res+1) + x; }
+
+  init(){
+    this.nodes.length=0; this.links.length=0; this.meshes.length=0; this.geos.length=0;
+    const step = this.size/this.res, half = this.size/2;
+
+    // nodes
+    for(let L=0; L<this.layers; L++){
+      const zOff = (L - (this.layers-1)/2) * this.gap;
+      for(let y=0;y<=this.res;y++){
+        for(let x=0;x<=this.res;x++){
+          const nx = x*step - half;
+          const nz = y*step - half;
+          const pinned = (x===0&&y===0)||(x===this.res&&y===0)||(x===0&&y===this.res)||(x===this.res&&y===this.res);
+          this.nodes.push(new Node(nx,0,nz,pinned));
+        }
+      }
+    }
+
+    // links per-layer
+    for(let L=0; L<this.layers; L++){
+      const base = L*(this.res+1)*(this.res+1);
+      for(let y=0;y<=this.res;y++){
+        for(let x=0;x<=this.res;x++){
+          const i = base + y*(this.res+1) + x;
+          const add=(u,v,k,type)=>{ const r = this.nodes[u].pos.distanceTo(this.nodes[v].pos); this.links.push(new Link(u,v,r,k,type)); };
+          if(x<this.res) add(i, base + y*(this.res+1) + (x+1), CONF.structK, 'struct');
+          if(y<this.res) add(i, base + (y+1)*(this.res+1) + x, CONF.structK, 'struct');
+          if(x<this.res && y<this.res) add(i, base + (y+1)*(this.res+1) + (x+1), CONF.shearK, 'shear');
+          if(x>0 && y<this.res) add(i, base + (y+1)*(this.res+1) + (x-1), CONF.shearK, 'shear');
+          if(x<this.res-1) add(i, base + y*(this.res+1) + (x+2), CONF.bendK, 'bend');
+          if(y<this.res-1) add(i, base + (y+2)*(this.res+1) + x, CONF.bendK, 'bend');
+        }
+      }
+    }
+
+    // thickness links connecting layers
+    for(let L=0; L<this.layers-1; L++){
+      const b1 = L*(this.res+1)*(this.res+1);
+      const b2 = (L+1)*(this.res+1)*(this.res+1);
+      for(let k=0;k<(this.res+1)*(this.res+1);k++){
+        const r = this.nodes[b1+k].pos.distanceTo(this.nodes[b2+k].pos);
+        this.links.push(new Link(b1+k, b2+k, r, CONF.thicknessK, 'thickness'));
+      }
+    }
+
+    // build plane meshes (order matches node order)
+    for(let L=0; L<this.layers; L++){
+      const geo = new THREE.PlaneGeometry(this.size, this.size, this.res, this.res);
+      geo.rotateX(-Math.PI/2);
+      const mat = new THREE.MeshStandardMaterial({ map: checkerTexture(), side: THREE.DoubleSide, roughness: 0.86, metalness: 0.03 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true; mesh.receiveShadow = true;
+      this.geos.push(geo); this.meshes.push(mesh);
+    }
+  }
+
+  addToScene(s){ this.meshes.forEach(m=>s.add(m)); }
+
+  integrate(dt){
+    const g = new THREE.Vector3(0, CONF.gravity, 0);
+    for(const n of this.nodes){
+      if(n.pinned) continue;
+      const grav = n.detached ? g.clone().multiplyScalar(1.06) : g;
+      n.acc.add(grav);
+      const vel = n.pos.clone().sub(n.prev).multiplyScalar(0.985);
+      const next = n.pos.clone().add(vel).add(n.acc.clone().multiplyScalar(dt*dt));
+      n.prev.copy(n.pos);
+      n.pos.copy(next);
+      n.acc.set(0,0,0);
+    }
+  }
+
+  satisfyConstraints(iterations){
+    for(let it=0; it<iterations; it++){
+      for(const L of this.links){
+        if(!L.active) continue;
+        const n1 = this.nodes[L.a], n2 = this.nodes[L.b];
+        const delta = n2.pos.clone().sub(n1.pos);
+        const dist = delta.length();
+        if(dist===0) continue;
+        const diff = (dist - L.rest) / dist;
+        let k = L.k;
+        if(L.type === 'thickness') k = CONF.thicknessK;
+        const corr = delta.multiplyScalar(0.5 * k * diff);
+        if(!n1.pinned) n1.pos.add(corr);
+        if(!n2.pinned) n2.pos.sub(corr);
+      }
+    }
+  }
+
+  updateMeshes(){
+    const row = this.res+1;
+    for(let L=0; L<this.layers; L++){
+      const geo = this.geos[L];
+      const pos = geo.attributes.position;
+      const base = L*row*row;
+      let idx=0;
+      for(let y=0;y<=this.res;y++){
+        for(let x=0;x<=this.res;x++){
+          const n = this.nodes[base + y*row + x];
+          pos.setXYZ(idx++, n.pos.x, n.pos.y, n.pos.z);
+        }
+      }
+      pos.needsUpdate = true;
+      geo.computeVertexNormals();
+    }
+  }
+
+  activeLinks(){ return this.links.filter(l=>l.active).length; }
+  detachedCount(){ return this.nodes.filter(n=>n.detached).length; }
+}
+
+/* ========== Cutter with full-spring-break for detached nodes (THE FIX) ========== */
+class Cutter {
+  constructor(sim, cam){
+    this.sim = sim;
+    this.cam = cam;
+    this.ray = new THREE.Raycaster();
+    this.mouse = new THREE.Vector2();
+    this.downAt = 0;
+    this.downScreen = null;
+    this.isDown = false;
+  }
+
+  toScreen(e){
+    this.mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+    this.mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+    return new THREE.Vector2(e.clientX, e.clientY);
+  }
+
+  pickWorld(e){
+    this.toScreen(e);
+    this.ray.setFromCamera(this.mouse, this.cam);
+    const hits = this.ray.intersectObject(this.sim.meshes[0], true);
+    if(hits.length === 0) return null;
+    return hits[0].point.clone();
+  }
+
+  down(e){
+    this.isDown = true;
+    this.downAt = performance.now();
+    this.downScreen = this.toScreen(e);
+    try{ if(window.audioCtx && window.audioCtx.state==='suspended') window.audioCtx.resume(); }catch{}
+  }
+
+  up(){ this.isDown = false; this.downScreen = null; }
+
+  pressure(e){
+    const held = Math.min(1.2, (performance.now() - this.downAt) / 1000);
+    let speed = 0;
+    if(this.downScreen){
+      const dx = Math.abs(e.clientX - this.downScreen.x);
+      const dy = Math.abs(e.clientY - this.downScreen.y);
+      speed = Math.min(3, Math.hypot(dx,dy) / 16);
+      this.downScreen.set(e.clientX, e.clientY);
+    }
+    return Math.min(1, (held*0.6 + speed*0.6) * CONF.pressureMultiplier);
+  }
+
+  cut(e){
+    if(!this.isDown) return;
+    if(performance.now() - lastCut < CONF.cutCooldown) return;
+
+    const world = this.pickWorld(e);
+    if(!world) return;
+    const p = this.pressure(e);
+    const r = CONF.baseCutR * (1 + p * 2.2);
+
+    playSliceSound(p);
+
+    // break links whose midpoint is within radius
+    let anyBroken=false;
+    for(const link of this.sim.links){
+      if(!link.active) continue;
+      const a = this.sim.nodes[link.a].pos;
+      const b = this.sim.nodes[link.b].pos;
+      const mid = a.clone().add(b).multiplyScalar(0.5);
+      const d = mid.distanceTo(world);
+      if(d < r){
+        if(link.type === 'thickness'){
+          if(p > 0.45){ link.active=false; anyBroken=true; }
+        } else {
+          link.active=false; anyBroken=true;
+        }
+      }
+    }
+
+    // find nodes close to the cut and mark them as detached (probabilistic raggedness)
+    const affected = [];
+    for(let i=0;i<this.sim.nodes.length;i++){
+      const n = this.sim.nodes[i];
+      if(n.pinned) continue;
+      if(n.detached) continue;
+      const dd = Math.hypot(n.pos.x - world.x, n.pos.z - world.z);
+      if(dd < r * 0.95){
+        const base = 0.28 + (1 - dd/(r*0.95)) * 0.72;
+        const chance = Math.min(1, base * (0.45 + p*1.1));
+        if(Math.random() < chance){
+          affected.push(i);
+        }
+      }
+    }
+
+    // === FIX: when marking nodes detached, break ALL springs touching that node (INCLUDING thickness) ===
+    if(affected.length >= Math.max(CONF.detachMinCount, Math.floor(r*20))){
+      for(const idx of affected){
+        const node = this.sim.nodes[idx];
+        node.detached = true;
+        // break all links connected to this node
+        for(const link of this.sim.links){
+          if(!link.active) continue;
+          if(link.a === idx || link.b === idx){
+            link.active = false;
+          }
+        }
+      }
+    } else if(anyBroken){
+      // if not many nodes, still try to break immediate neighbors' links for consistent visual
+      // (small heuristic: break links whose midpoint was very near)
+      for(const link of this.sim.links){
+        if(!link.active) continue;
+        const a = this.sim.nodes[link.a].pos;
+        const b = this.sim.nodes[link.b].pos;
+        const mid = a.clone().add(b).multiplyScalar(0.5);
+        if(mid.distanceTo(world) < r*0.6){
+          link.active = false;
+        }
+      }
+    }
+
+    // widen rim for visual gap (push edge nodes out a bit)
+    this.widenRim(world, r, CONF.widenFactor * (0.5 + p*1.2));
+
+    if(anyBroken || affected.length>0) lastCut = performance.now();
+  }
+
+  widenRim(center, radius, factor){
+    for(const n of this.sim.nodes){
+      if(n.detached) continue;
+      const d = Math.hypot(n.pos.x - center.x, n.pos.z - center.z);
+      if(d < radius*1.2 && d > radius*0.6){
+        const dir = new THREE.Vector3(n.pos.x - center.x, 0, n.pos.z - center.z).normalize();
+        if(dir.lengthSq()>0 && !n.pinned){
+          n.pos.add(dir.multiplyScalar((radius - d) * factor));
+        }
+      }
+    }
+  }
+}
+
+/* ========== Sound ========== */
+let audioCtx=null;
+function playSliceSound(strength){
+  try{
+    if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    const o=audioCtx.createOscillator();
+    const g=audioCtx.createGain();
+    o.type='triangle'; o.frequency.value=300 + strength*900;
+    g.gain.value=0.0008;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    g.gain.linearRampToValueAtTime(0.18,audioCtx.currentTime+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001,audioCtx.currentTime+0.28);
+    o.stop(audioCtx.currentTime+0.32);
+  }catch(e){}
+}
+
+/* ========== Scene setup ========== */
+function setup(){
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0b0f);
+
+  camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+  camera.position.set(10,10,22);
+
+  renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled=true;
+  document.body.appendChild(renderer.domElement);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping=true;
+
+  scene.add(new THREE.AmbientLight(0xffffff,0.75));
+  const dl = new THREE.DirectionalLight(0xffffff,1.0);
+  dl.position.set(12,18,10); dl.castShadow=true; scene.add(dl);
+
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(60,60), new THREE.MeshStandardMaterial({color:0x070707, roughness:0.95}));
+  ground.rotation.x = -Math.PI/2;
+  ground.position.y = -CONF.size/2 - 0.05;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  clothSim = new ClothSim(CONF.size, CONF.res, CONF.layers, CONF.layerGap);
+
+  // try load uploaded texture, fallback to checker
+  const texLoader = new THREE.TextureLoader();
+  texLoader.load(UPLOADED,
+    tex => {
+      clothSim.meshes.forEach(m => { m.material.map = tex; m.material.needsUpdate = true; });
+    },
+    undefined,
+    () => { /* keep checker */ }
+  );
+
+  clothSim.addToScene(scene);
+
+  cutter = new Cutter(clothSim, camera);
+
+  // UI handlers
+  document.getElementById('struct').oninput = (e) => { CONF.structK = +e.target.value; document.getElementById('sK').textContent = CONF.structK.toFixed(2); };
+  document.getElementById('thick').oninput = (e) => { CONF.thicknessK = +e.target.value; document.getElementById('tK').textContent = CONF.thicknessK.toFixed(2); };
+  document.getElementById('itersRange').oninput = (e) => { CONF.solverIters = +e.target.value; document.getElementById('iters').textContent = CONF.solverIters; };
+  document.getElementById('press').oninput = (e) => { CONF.pressureMultiplier = +e.target.value; document.getElementById('pM').textContent = CONF.pressureMultiplier.toFixed(2); };
+  document.getElementById('reset').onclick = () => {
+    clothSim.meshes.forEach(m => { try{ scene.remove(m); }catch{} });
+    clothSim = new ClothSim(CONF.size, CONF.res, CONF.layers, CONF.layerGap);
+    clothSim.addToScene(scene);
+    cutter = new Cutter(clothSim, camera);
+  };
+
+  window.addEventListener('pointerdown', (ev) => { if(ev.button===0) cutter.down(ev); });
+  window.addEventListener('pointerup', (ev) => { if(ev.button===0) cutter.up(ev); });
+  window.addEventListener('pointermove', (ev) => { cutter.cut(ev); });
+  window.addEventListener('resize', () => { camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+}
+
+/* ========== Main loop ========== */
+function animate(){
+  requestAnimationFrame(animate);
+
+  clothSim.integrate(CONF.dt);
+  clothSim.satisfyConstraints(CONF.solverIters);
+  clothSim.updateMeshes();
+
+  controls.update();
+  renderer.render(scene, camera);
+
+  statusEl.textContent = `Particles: ${clothSim.nodes.length} | Springs: ${clothSim.activeLinks()} | Detached: ${clothSim.detachedCount()}`;
+}
+
+/* ========== Start ========== */
+setup();
+animate();
+
+</script>
+</body>
+</html>
