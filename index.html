@@ -64,7 +64,6 @@ const CONF = {
   detachMinCount: 6,
 };
 
-/* ========== Globals ========== */
 let renderer, scene, camera, controls;
 let clothSim, cutter;
 let lastCut = 0;
@@ -85,7 +84,6 @@ function checkerTexture(c1='#ffe0b5', c2='#d49352') {
   return t;
 }
 
-/* ========== Node + Link ========== */
 class Node {
   constructor(x,y,z,pinned=false){
     this.pos = new THREE.Vector3(x,y,z);
@@ -128,7 +126,7 @@ class ClothSim {
       }
     }
 
-    // links per-layer
+
     for(let L=0; L<this.layers; L++){
       const base = L*(this.res+1)*(this.res+1);
       for(let y=0;y<=this.res;y++){
@@ -155,7 +153,6 @@ class ClothSim {
       }
     }
 
-    // build plane meshes (order matches node order)
     for(let L=0; L<this.layers; L++){
       const geo = new THREE.PlaneGeometry(this.size, this.size, this.res, this.res);
       geo.rotateX(-Math.PI/2);
@@ -222,7 +219,6 @@ class ClothSim {
   detachedCount(){ return this.nodes.filter(n=>n.detached).length; }
 }
 
-/* ========== Cutter with full-spring-break for detached nodes (THE FIX) ========== */
 class Cutter {
   constructor(sim, cam){
     this.sim = sim;
@@ -297,7 +293,6 @@ class Cutter {
       }
     }
 
-    // find nodes close to the cut and mark them as detached (probabilistic raggedness)
     const affected = [];
     for(let i=0;i<this.sim.nodes.length;i++){
       const n = this.sim.nodes[i];
@@ -313,7 +308,6 @@ class Cutter {
       }
     }
 
-    // === FIX: when marking nodes detached, break ALL springs touching that node (INCLUDING thickness) ===
     if(affected.length >= Math.max(CONF.detachMinCount, Math.floor(r*20))){
       for(const idx of affected){
         const node = this.sim.nodes[idx];
@@ -377,7 +371,6 @@ function playSliceSound(strength){
   }catch(e){}
 }
 
-/* ========== Scene setup ========== */
 function setup(){
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b0b0f);
@@ -404,8 +397,7 @@ function setup(){
   scene.add(ground);
 
   clothSim = new ClothSim(CONF.size, CONF.res, CONF.layers, CONF.layerGap);
-
-  // try load uploaded texture, fallback to checker
+  
   const texLoader = new THREE.TextureLoader();
   texLoader.load(UPLOADED,
     tex => {
@@ -419,7 +411,6 @@ function setup(){
 
   cutter = new Cutter(clothSim, camera);
 
-  // UI handlers
   document.getElementById('struct').oninput = (e) => { CONF.structK = +e.target.value; document.getElementById('sK').textContent = CONF.structK.toFixed(2); };
   document.getElementById('thick').oninput = (e) => { CONF.thicknessK = +e.target.value; document.getElementById('tK').textContent = CONF.thicknessK.toFixed(2); };
   document.getElementById('itersRange').oninput = (e) => { CONF.solverIters = +e.target.value; document.getElementById('iters').textContent = CONF.solverIters; };
@@ -437,7 +428,6 @@ function setup(){
   window.addEventListener('resize', () => { camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 }
 
-/* ========== Main loop ========== */
 function animate(){
   requestAnimationFrame(animate);
 
@@ -458,3 +448,4 @@ animate();
 </script>
 </body>
 </html>
+
