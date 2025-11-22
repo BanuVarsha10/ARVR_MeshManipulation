@@ -14,14 +14,14 @@ Particles (Nodes)
 
 - Verlet Integration
   Verlet is used for stability under tearing:
-  vel = pos - prev;
-  nextPos = pos + vel + acc * dt²;
+  -vel = pos - prev;
+  -nextPos = pos + vel + acc * dt²;
   
   This handles:
-  gravity
-  sudden spring breaks
-  large deformations
-  soft cloth motion
+  gravity,
+  sudden spring breaks,
+  large deformations,
+  soft cloth motion,
   Much better than Euler for destruction.
 
 ## Spring System
